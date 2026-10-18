@@ -1,0 +1,42 @@
+[project]
+name = "speculative-decode-from-scratch"
+version = "0.1.0"
+description = "A minimal from-scratch speculative decoding demo (autoregressive vs. speculative sampling) with small Qwen models on Apple Silicon (PyTorch MPS and MLX)."
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+  # 核心推理：PyPI 上的 torch 已提供 macOS arm64 wheel，自带 MPS 后端
+  "torch==2.9.1",
+  # 4.57.x 原生支持 Qwen2.5 / Qwen3
+  "transformers==4.57.1",
+  # 计时，用于对比 tokens/s
+  "contexttimer>=0.3.3",
+  # 简易推理服务（serving.py）
+  "flask>=3.0",
+  # 终端彩色输出，区分 draft / target 生成的 token
+  "colorama>=0.4.6",
+  # 注意：不安装 transformers_stream_generator。它只服务于旧版 Qwen(v1) 的 remote code，
+  # 且依赖已在 transformers 4.57 中移除的 BeamSearchScorer，导入即报错。
+]
+
+[project.optional-dependencies]
+# 第二后端：uv sync --extra mlx
+# mlx-lm >= 0.30 要求 transformers >= 5.7，与上面的 4.57.1 冲突，因此锁定 0.29.1
+mlx = [
+  "mlx-lm==0.29.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.9.0",
+]
+
+[tool.uv]
+# 纯脚本项目，不打包安装
+package = false
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]

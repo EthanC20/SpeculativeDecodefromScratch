@@ -1,0 +1,3 @@
+.venv/
+.ruff_cache/
+hf_models/
