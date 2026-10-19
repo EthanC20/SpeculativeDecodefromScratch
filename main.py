@@ -19,7 +19,7 @@ def parse_arguments():
     parser.add_argument('--target_model_name', type=str, default=str(DEFAULT_TARGET_MODEL))
     parser.add_argument('--num_tokens', type=int, default=20)
     parser.add_argument('--gamma', type=int, default=4)
-    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--temperature', type=float, default=1.0, help='0 means greedy decoding')
     parser.add_argument('--top_k', type=int, default=10)
     parser.add_argument('--top_p', type=float, default=0.0)
     parser.add_argument('--seed', type=int, default=42)
@@ -55,19 +55,27 @@ def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0)
     return logits
 
 
-def sample(
+def norm_logits(
     logits: torch.Tensor,
     temperature: float,
     top_k: int,
     top_p: float,
 ) -> torch.Tensor:
     '''
-    从 (batch, vocab) logits 中抽一个 token,返回形状 (batch, 1)
-    权重是 bfloat16 过滤和 softmax 放到 float32 避免 MPS 上概率比较失真
+    把 (batch, vocab) logits 变成实际采样所用的概率 p' / q'
+    草稿采样、验证、残差和 bonus 都必须用同一个变换，否则投机采样不再无损
+    temperature=0 表示 greedy,返回 argmax 的 one-hot
+    权重是 bfloat16,这里统一升到 float32,避免 MPS 上概率比较失真
     '''
-    logits = logits.float() / temperature
-    logits = top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
-    probs = F.softmax(logits, dim=-1)
+    logits = logits.float()
+    if temperature == 0:
+        return F.one_hot(logits.argmax(dim=-1), num_classes=logits.size(-1)).float()
+    logits = top_k_top_p_filter(logits / temperature, top_k=top_k, top_p=top_p)
+    return F.softmax(logits, dim=-1)
+
+
+def sample(probs: torch.Tensor) -> torch.Tensor:
+    '''从 (batch, vocab) 概率中抽一个 token,返回形状 (batch, 1)。'''
     return torch.multinomial(probs, num_samples=1)
 
 
@@ -84,7 +92,7 @@ def autoregressive_sampling(
     with torch.no_grad(), tqdm(total=n_new_tokens, desc='autoregressive sampling') as pbar:
         while generated < n_new_tokens:
             logits = model(x, use_cache=False).logits[:, -1, :]
-            next_token = sample(logits, temperature, top_k, top_p)
+            next_token = sample(norm_logits(logits, temperature, top_k, top_p))
             x = torch.cat((x, next_token), dim=1)
             generated += 1
             pbar.update(1)
@@ -97,9 +105,26 @@ def max_fn(x: torch.Tensor) -> torch.Tensor:
     return x_max / torch.sum(x_max, dim=-1, keepdim=True)
 
 
-def norm_logits(logits: torch.Tensor) -> torch.Tensor:
-    '''沿词表维把 logits 变成概率,比较拒绝采样前先升到 float32.'''
-    return F.softmax(logits.float(), dim=-1)
+def verify_draft(
+    p: torch.Tensor,
+    q: torch.Tensor,
+    draft_tokens: torch.Tensor,
+) -> tuple[int, torch.Tensor]:
+    '''
+    对 k 个草稿 token 逐个做拒绝采样
+    p: (k + 1, vocab) 目标模型在每个草稿位置及其后一位的处理后概率
+    q: (k, vocab) 草稿模型抽取每个 token 时实际用的处理后概率
+    draft_tokens: (k,)
+    返回 (接受的草稿数, 本轮最后追加的 token,形状 (1, 1))
+    '''
+    k = draft_tokens.shape[0]
+    for i in range(k):
+        token = draft_tokens[i]
+        r = torch.rand(1, device=p.device)
+        # 以 min(1, p/q) 的概率接受;写成 >= 保证 p=0 时必拒绝
+        if r >= p[i, token] / q[i, token]:
+            return i, sample(max_fn(p[i : i + 1] - q[i : i + 1]))
+    return k, sample(p[k : k + 1])
 
 
 def speculative_sampling(
@@ -113,49 +138,31 @@ def speculative_sampling(
     top_p: float = 0,
 ) -> torch.Tensor:
     '''草稿模型一次猜 gamma 个 token,目标模型一次前向验证并接受或拒绝。'''
-    seq_len = prefix.shape[1]
-    target_len = seq_len + max_len
+    target_len = prefix.shape[1] + max_len
     assert prefix.shape[0] == 1, 'input batch size must be 1'
+    assert prefix.shape[1] > 0, 'prompt must contain at least one token'
 
-    with torch.no_grad(), tqdm(total=target_len, desc='speculative sampling') as pbar:
+    with torch.no_grad(), tqdm(total=max_len, desc='speculative sampling') as pbar:
         while prefix.shape[1] < target_len:
-            x = prefix
             prefix_len = prefix.shape[1]
-            for _ in range(gamma):
-                # 因果模型:最后一次前向在更早位置上的分布,就是起草这些 token 时用的 q
-                q = approx_model(x, use_cache=False).logits
-                next_token = sample(q[:, -1, :], temperature, top_k, top_p)
-                x = torch.cat((x, next_token), dim=1)
+            # 每轮最多产出 k 个草稿加 1 个修正/bonus token,k 不能让长度超过 target_len
+            k = min(gamma, target_len - prefix_len - 1)
 
-            q = norm_logits(q)
-            p = norm_logits(target_model(x, use_cache=False).logits)
+            x = prefix
+            q_steps = []
+            for _ in range(k):
+                q_logits = approx_model(x, use_cache=False).logits[:, -1, :]
+                q_step = norm_logits(q_logits, temperature, top_k, top_p)
+                q_steps.append(q_step)
+                x = torch.cat((x, sample(q_step)), dim=1)
 
-            # n 是本轮仍然有效的最后一个位置
-            n = prefix_len + gamma - 1
-            for i in range(gamma):
-                r = torch.rand(1, device=p.device)
-                drafted_token = x[:, prefix_len + i]
-                accept_ratio = (
-                    p[:, prefix_len + i - 1, drafted_token]
-                    / q[:, prefix_len + i - 1, drafted_token]
-                )
-                if r > accept_ratio:
-                    n = prefix_len + i - 1
-                    break
+            target_logits = target_model(x, use_cache=False).logits[0, prefix_len - 1 :, :]
+            p = norm_logits(target_logits, temperature, top_k, top_p)
+            q = torch.cat(q_steps, dim=0) if q_steps else p[:0]
 
-            assert n >= prefix_len - 1, f'n {n}, prefix_len {prefix_len}'
-            prefix = x[:, : n + 1]
-
-            if n < prefix_len + gamma - 1:
-                # 拒绝后从 norm(max(0, p - q)) 重采样
-                corrected = max_fn(p[:, n, :] - q[:, n, :])
-                bonus = sample(corrected, temperature, top_k, top_p)
-            else:
-                assert n == p.shape[1] - 1
-                bonus = sample(p[:, -1, :], temperature, top_k, top_p)
-
-            prefix = torch.cat((prefix, bonus), dim=1)
-            pbar.update(n - pbar.n)
+            n_accepted, next_token = verify_draft(p, q, x[0, prefix_len:])
+            prefix = torch.cat((x[:, : prefix_len + n_accepted], next_token), dim=1)
+            pbar.update(n_accepted + 1)
 
     return prefix
 
