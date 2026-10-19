@@ -124,6 +124,15 @@ class KVCacheModel:
         self.cache.crop(length)
 
 
+def validate_sampling_args(temperature: float, top_p: float, gamma: int = 1) -> None:
+    if temperature < 0:
+        raise ValueError('temperature must be >= 0')
+    if not 0.0 <= top_p <= 1.0:
+        raise ValueError('top_p must be in [0, 1]')
+    if gamma < 1:
+        raise ValueError('gamma must be >= 1')
+
+
 def autoregressive_sampling(
     x: torch.Tensor,
     model: torch.nn.Module,
@@ -133,6 +142,7 @@ def autoregressive_sampling(
     top_p: float = 0,
 ) -> torch.Tensor:
     '''只用 target model 逐 token 生成,作为投机采样的对照。'''
+    validate_sampling_args(temperature, top_p)
     cached_model = KVCacheModel(model)
     generated = 0
     with torch.no_grad(), tqdm(total=n_new_tokens, desc='autoregressive sampling') as pbar:
@@ -187,6 +197,7 @@ def speculative_sampling(
     草稿模型一次猜 gamma 个 token,目标模型一次前向验证并接受或拒绝
     每轮开始时目标模型的 cache 覆盖 prefix[:-1],本轮只需喂入最后一个已确定 token 和 k 个草稿
     '''
+    validate_sampling_args(temperature, top_p, gamma)
     target_len = prefix.shape[1] + max_len
     assert prefix.shape[0] == 1, 'input batch size must be 1'
     assert prefix.shape[1] > 0, 'prompt must contain at least one token'
@@ -245,6 +256,8 @@ def generate(
     top_p: float = 0.0,
     seed: int = 123,
 ) -> None:
+    # 加载模型要十几秒，参数错误应在此之前报出
+    validate_sampling_args(temperature, top_p, gamma)
     device = pick_device()
     print(f'device: {device}, dtype: bfloat16')
 
