@@ -2,15 +2,15 @@
 
 `main.py` runs two decoders on the same prompt and seed. A small draft model proposes tokens, and a larger target model accepts or rejects them in one forward pass. The script then generates again with the target model alone, one token at a time.
 
-The default pair is local `Qwen2.5-0.5B-Instruct` (draft) and `Qwen2.5-3B-Instruct` (target). Both must share a tokenizer and vocabulary. Weights load in bfloat16; sampling math is done in float32. The device is MPS when it is available, otherwise CPU.
+The default pair is local base models `Qwen2.5-0.5B` (draft) and `Qwen2.5-3B` (target), since the task is plain next-token continuation without a chat template. Both must share a tokenizer and vocabulary. Weights load in bfloat16; sampling math is done in float32. The device is MPS when it is available, otherwise CPU.
 
-Both models keep a `DynamicCache`, so each forward pass only processes tokens the cache has not seen, and `logits_to_keep` limits the LM head to the positions that are sampled or verified. After a rejection, both caches are cropped back to the last accepted token. After a warm-up pass, the script prints wall time and tokens per second for each decoder.
+Both models keep a `DynamicCache`, so each forward pass only processes tokens the cache has not seen, and `logits_to_keep` limits the LM head to the positions that are sampled or verified. After a rejection, both caches are cropped back to the last accepted token.
 
 Place the Hugging Face snapshots here (this directory is gitignored):
 
 ```
-hf_models/Qwen2.5-0.5B-Instruct/
-hf_models/Qwen2.5-3B-Instruct/
+hf_models/Qwen2.5-0.5B/
+hf_models/Qwen2.5-3B/
 ```
 
 ## Usage
@@ -21,6 +21,17 @@ uv run python main.py --input "A dog has four "
 ```
 
 `--approx_model_name` and `--target_model_name` override the paths above. `--num_tokens` (default 20) and `--gamma` (default 4) set the length and the draft window. See `python main.py --help` for temperature (`0` is greedy), top-k, top-p, and seed.
+
+After one warm-up pass, both decoders are timed with `contexttimer`, with an MPS synchronize at each end. The script prints both texts and then a summary like:
+
+```
+speculative (gamma=4): 64 tokens in 3.68s (17.4 tok/s)
+  20 rounds, accepted 44/78 drafts (56.4%), 2.20 accepted and 3.20 tokens per target forward
+autoregressive: 64 tokens in 3.43s (18.7 tok/s)
+speedup: 0.93x
+```
+
+The acceptance rate is accepted drafts over proposed drafts. Each round also appends one corrected or bonus token, so tokens per target forward is accepted per round plus one. In bfloat16 on MPS, greedy outputs of the two decoders can still split at a near-tie: one target forward over k+1 tokens rounds differently from k+1 single-token forwards. The float32 tests require an exact match.
 
 ## Tests
 
