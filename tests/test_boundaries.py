@@ -87,6 +87,27 @@ def test_all_drafts_accepted_when_models_match(gamma, n_new_tokens):
     assert draft.calls == expected_draft_calls
 
 
+@pytest.mark.parametrize(
+    ('overrides', 'message'),
+    [
+        (dict(temperature=-0.1), 'temperature must be >= 0'),
+        (dict(top_p=-0.1), r'top_p must be in \[0, 1\]'),
+        (dict(top_p=1.5), r'top_p must be in \[0, 1\]'),
+        (dict(gamma=0), 'gamma must be >= 1'),
+    ],
+)
+def test_invalid_arguments_are_rejected(overrides, message):
+    model = ContextFreeModel(torch.zeros(VOCAB_SIZE))
+    kwargs = dict(gamma=2, **SAMPLING) | overrides
+    with pytest.raises(ValueError, match=message):
+        main.speculative_sampling(PROMPT, model, model, 3, **kwargs)
+    if 'gamma' not in overrides:
+        kwargs.pop('gamma')
+        with pytest.raises(ValueError, match=message):
+            main.autoregressive_sampling(PROMPT, model, 3, **kwargs)
+    assert model.calls == 0
+
+
 @pytest.mark.parametrize(('n_new_tokens', 'gamma'), [(0, 4), (1, 4), (2, 4), (3, 4)])
 def test_fewer_tokens_than_gamma(n_new_tokens, gamma):
     '''num_tokens <= γ 时只跑一轮，草稿数被截到 num_tokens - 1。'''
