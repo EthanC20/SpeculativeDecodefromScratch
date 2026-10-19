@@ -28,12 +28,18 @@ mlx = [
 
 [dependency-groups]
 dev = [
+  "pytest>=9.1.1",
   "ruff>=0.9.0",
 ]
 
 [tool.uv]
 # 纯脚本项目，不打包安装
 package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# main.py 位于项目根目录，不是可安装包
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

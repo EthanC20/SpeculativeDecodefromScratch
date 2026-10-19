@@ -18,7 +18,15 @@ uv sync
 uv run python main.py --input "A dog has four "
 ```
 
-`--approx_model_name` and `--target_model_name` override the paths above. `--num_tokens` (default 20) and `--gamma` (default 4) set the length and the draft window. See `python main.py --help` for temperature, top-k, top-p, and seed.
+`--approx_model_name` and `--target_model_name` override the paths above. `--num_tokens` (default 20) and `--gamma` (default 4) set the length and the draft window. See `python main.py --help` for temperature (`0` is greedy), top-k, top-p, and seed.
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+The tests check that speculative sampling is lossless: on toy models, sampled tokens follow the target model's processed distribution (chi-square and total variation), and at temperature 0 the output matches the target model's greedy decode token for token. They also cover γ=1, rejection at the first draft, full acceptance, and `num_tokens < γ`. The greedy test downloads the 19 MB [`onnx-internal-testing/tiny-random-Qwen2ForCausalLM`](https://huggingface.co/onnx-internal-testing/tiny-random-Qwen2ForCausalLM) on first run and is skipped if it cannot be loaded.
 
 ## References
 
