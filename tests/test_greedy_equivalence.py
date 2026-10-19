@@ -4,7 +4,7 @@ import copy
 
 import pytest
 import torch
-from toy_models import BigramModel, CallCounter, greedy_reference
+from toy_models import BigramModel, CallCounter, greedy_reference, greedy_speculative_reference
 from transformers import AutoModelForCausalLM
 
 import main
@@ -60,6 +60,12 @@ def test_tiny_qwen2_greedy_matches_target(tiny_qwen2, draft_kind, gamma):
     expected = greedy_reference(tiny_qwen2, prompt, n_new_tokens)
     actual = main.speculative_sampling(prompt, draft, target, n_new_tokens, gamma=gamma, **GREEDY)
     assert torch.equal(actual, expected)
+
+    # 草稿 cache 若没回滚干净，greedy 输出仍会正确，但接受/拒绝的轮次会和整段重算不同
+    _, reference_target_calls, _ = greedy_speculative_reference(
+        draft, tiny_qwen2, prompt, n_new_tokens, gamma
+    )
+    assert target.calls == reference_target_calls
 
     autoregressive = main.autoregressive_sampling(prompt, tiny_qwen2, n_new_tokens, **GREEDY)
     assert torch.equal(autoregressive, expected)
