@@ -4,6 +4,8 @@
 
 The default pair is local `Qwen2.5-0.5B-Instruct` (draft) and `Qwen2.5-3B-Instruct` (target). Both must share a tokenizer and vocabulary. Weights load in bfloat16; sampling math is done in float32. The device is MPS when it is available, otherwise CPU.
 
+Both models keep a `DynamicCache`, so each forward pass only processes tokens the cache has not seen, and `logits_to_keep` limits the LM head to the positions that are sampled or verified. After a rejection, both caches are cropped back to the last accepted token. After a warm-up pass, the script prints wall time and tokens per second for each decoder.
+
 Place the Hugging Face snapshots here (this directory is gitignored):
 
 ```
@@ -26,7 +28,7 @@ uv run python main.py --input "A dog has four "
 uv run pytest
 ```
 
-The tests check that speculative sampling is lossless: on toy models, sampled tokens follow the target model's processed distribution (chi-square and total variation), and at temperature 0 the output matches the target model's greedy decode token for token. They also cover γ=1, rejection at the first draft, full acceptance, and `num_tokens < γ`. The greedy test downloads the 19 MB [`onnx-internal-testing/tiny-random-Qwen2ForCausalLM`](https://huggingface.co/onnx-internal-testing/tiny-random-Qwen2ForCausalLM) on first run and is skipped if it cannot be loaded.
+The tests check that speculative sampling is lossless: on toy models, sampled tokens follow the target model's processed distribution (chi-square and total variation), and at temperature 0 the output matches the target model's greedy decode token for token. They also cover γ=1, rejection at the first draft, full acceptance, and `num_tokens < γ`. KV-cache tests compare cached logits after rollback with a full recompute, and check that each position reaches the target model once and that the LM head returns only the rows that are used. The greedy test downloads the 19 MB [`onnx-internal-testing/tiny-random-Qwen2ForCausalLM`](https://huggingface.co/onnx-internal-testing/tiny-random-Qwen2ForCausalLM) on first run and is skipped if it cannot be loaded.
 
 ## References
 

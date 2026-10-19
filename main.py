@@ -1,10 +1,12 @@
 import argparse
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
 from torch.nn import functional as F
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 # 草稿模型与目标模型必须共用同一套词表，否则无法逐 token 比较概率
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -36,6 +38,20 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
+
+
+def synchronize(device: torch.device) -> None:
+    # MPS 是异步提交，不同步的话测到的只是提交时间
+    if device.type == 'mps':
+        torch.mps.synchronize()
+
+
+def timed(fn: Callable[[], torch.Tensor], device: torch.device) -> tuple[torch.Tensor, float]:
+    synchronize(device)
+    start = time.perf_counter()
+    out = fn()
+    synchronize(device)
+    return out, time.perf_counter() - start
 
 
 def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0) -> torch.Tensor:
@@ -79,6 +95,35 @@ def sample(probs: torch.Tensor) -> torch.Tensor:
     return torch.multinomial(probs, num_samples=1)
 
 
+class KVCacheModel:
+    '''
+    用 DynamicCache 记住已经算过的前缀，每次只把 cache 之后的新 token 喂给模型
+    lm_head 只对最后 logits_to_keep 个位置计算
+    '''
+
+    def __init__(self, model: torch.nn.Module):
+        self.model = model
+        self.cache = DynamicCache()
+
+    def __call__(self, x: torch.Tensor, logits_to_keep: int) -> torch.Tensor:
+        '''x 是完整序列，返回最后 logits_to_keep 个位置的 logits,形状 (batch, logits_to_keep, vocab)'''
+        new_ids = x[:, self.cache.get_seq_length() :]
+        assert new_ids.shape[1] >= logits_to_keep, (
+            f'only {new_ids.shape[1]} uncached tokens, cannot keep {logits_to_keep} logits'
+        )
+        out = self.model(
+            new_ids,
+            past_key_values=self.cache,
+            use_cache=True,
+            logits_to_keep=logits_to_keep,
+        )
+        return out.logits
+
+    def rollback(self, length: int) -> None:
+        '''丢掉位置 length 及之后的 KV;cache 本来就更短时不变'''
+        self.cache.crop(length)
+
+
 def autoregressive_sampling(
     x: torch.Tensor,
     model: torch.nn.Module,
@@ -88,10 +133,11 @@ def autoregressive_sampling(
     top_p: float = 0,
 ) -> torch.Tensor:
     '''只用 target model 逐 token 生成,作为投机采样的对照。'''
+    cached_model = KVCacheModel(model)
     generated = 0
     with torch.no_grad(), tqdm(total=n_new_tokens, desc='autoregressive sampling') as pbar:
         while generated < n_new_tokens:
-            logits = model(x, use_cache=False).logits[:, -1, :]
+            logits = cached_model(x, logits_to_keep=1)[:, -1, :]
             next_token = sample(norm_logits(logits, temperature, top_k, top_p))
             x = torch.cat((x, next_token), dim=1)
             generated += 1
@@ -137,10 +183,16 @@ def speculative_sampling(
     top_k: int = 0,
     top_p: float = 0,
 ) -> torch.Tensor:
-    '''草稿模型一次猜 gamma 个 token,目标模型一次前向验证并接受或拒绝。'''
+    '''
+    草稿模型一次猜 gamma 个 token,目标模型一次前向验证并接受或拒绝
+    每轮开始时目标模型的 cache 覆盖 prefix[:-1],本轮只需喂入最后一个已确定 token 和 k 个草稿
+    '''
     target_len = prefix.shape[1] + max_len
     assert prefix.shape[0] == 1, 'input batch size must be 1'
     assert prefix.shape[1] > 0, 'prompt must contain at least one token'
+
+    draft = KVCacheModel(approx_model)
+    target = KVCacheModel(target_model)
 
     with torch.no_grad(), tqdm(total=max_len, desc='speculative sampling') as pbar:
         while prefix.shape[1] < target_len:
@@ -151,16 +203,19 @@ def speculative_sampling(
             x = prefix
             q_steps = []
             for _ in range(k):
-                q_logits = approx_model(x, use_cache=False).logits[:, -1, :]
+                q_logits = draft(x, logits_to_keep=1)[:, -1, :]
                 q_step = norm_logits(q_logits, temperature, top_k, top_p)
                 q_steps.append(q_step)
                 x = torch.cat((x, sample(q_step)), dim=1)
 
-            target_logits = target_model(x, use_cache=False).logits[0, prefix_len - 1 :, :]
+            target_logits = target(x, logits_to_keep=k + 1)[0]
             p = norm_logits(target_logits, temperature, top_k, top_p)
             q = torch.cat(q_steps, dim=0) if q_steps else p[:0]
 
             n_accepted, next_token = verify_draft(p, q, x[0, prefix_len:])
+            # 被拒绝的草稿已经写进两边的 cache,回滚到最后一个被接受的位置
+            draft.rollback(prefix_len + n_accepted)
+            target.rollback(prefix_len + n_accepted)
             prefix = torch.cat((x[:, : prefix_len + n_accepted], next_token), dim=1)
             pbar.update(n_accepted + 1)
 
@@ -203,32 +258,26 @@ def generate(
         )
 
     input_ids = tokenizer.encode(input_text, return_tensors='pt').to(device)
+    sampling = dict(temperature=temperature, top_k=top_k, top_p=top_p)
 
-    set_seed(seed)
-    speculative_ids = speculative_sampling(
-        input_ids,
-        approx_model,
-        target_model,
-        num_tokens,
-        gamma=gamma,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-    )
-    speculative_text = tokenizer.decode(speculative_ids[0], skip_special_tokens=True)
-    print(f'speculative_sampling: {speculative_text}')
+    def run_speculative(n: int) -> torch.Tensor:
+        return speculative_sampling(input_ids, approx_model, target_model, n, gamma=gamma, **sampling)
 
-    set_seed(seed)
-    autoregressive_ids = autoregressive_sampling(
-        input_ids,
-        target_model,
-        num_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-    )
-    autoregressive_text = tokenizer.decode(autoregressive_ids[0], skip_special_tokens=True)
-    print(f'autoregressive_sampling: {autoregressive_text}')
+    def run_autoregressive(n: int) -> torch.Tensor:
+        return autoregressive_sampling(input_ids, target_model, n, **sampling)
+
+    # MPS 第一次运行会编译 Metal kernel,计时前两条路径各预热一次
+    run_speculative(gamma + 1)
+    run_autoregressive(2)
+
+    for name, run in (
+        ('speculative_sampling', run_speculative),
+        ('autoregressive_sampling', run_autoregressive),
+    ):
+        set_seed(seed)
+        output_ids, elapsed = timed(lambda run=run: run(num_tokens), device)
+        text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        print(f'{name} ({elapsed:.2f}s, {num_tokens / elapsed:.1f} tok/s): {text}')
 
 
 if __name__ == '__main__':
