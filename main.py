@@ -1,6 +1,4 @@
 import argparse
-import time
-from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -8,10 +6,13 @@ from torch.nn import functional as F
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
+from metrics import SpeculativeStats, device_timer, throughput_summary
+
 # 草稿模型与目标模型必须共用同一套词表，否则无法逐 token 比较概率
+# 用 base 模型而不是 Instruct:任务是续写纯文本，不套 chat template
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_APPROX_MODEL = PROJECT_ROOT / 'hf_models' / 'Qwen2.5-0.5B-Instruct'
-DEFAULT_TARGET_MODEL = PROJECT_ROOT / 'hf_models' / 'Qwen2.5-3B-Instruct'
+DEFAULT_APPROX_MODEL = PROJECT_ROOT / 'hf_models' / 'Qwen2.5-0.5B'
+DEFAULT_TARGET_MODEL = PROJECT_ROOT / 'hf_models' / 'Qwen2.5-3B'
 
 
 def parse_arguments():
@@ -38,20 +39,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
-
-
-def synchronize(device: torch.device) -> None:
-    # MPS 是异步提交，不同步的话测到的只是提交时间
-    if device.type == 'mps':
-        torch.mps.synchronize()
-
-
-def timed(fn: Callable[[], torch.Tensor], device: torch.device) -> tuple[torch.Tensor, float]:
-    synchronize(device)
-    start = time.perf_counter()
-    out = fn()
-    synchronize(device)
-    return out, time.perf_counter() - start
 
 
 def top_k_top_p_filter(logits: torch.Tensor, top_k: int = 0, top_p: float = 0.0) -> torch.Tensor:
@@ -192,10 +179,12 @@ def speculative_sampling(
     temperature: float = 1,
     top_k: int = 0,
     top_p: float = 0,
+    stats: SpeculativeStats | None = None,
 ) -> torch.Tensor:
     '''
     草稿模型一次猜 gamma 个 token,目标模型一次前向验证并接受或拒绝
     每轮开始时目标模型的 cache 覆盖 prefix[:-1],本轮只需喂入最后一个已确定 token 和 k 个草稿
+    传入 stats 时按轮累加草稿数和接受数
     '''
     validate_sampling_args(temperature, top_p, gamma)
     target_len = prefix.shape[1] + max_len
@@ -224,6 +213,8 @@ def speculative_sampling(
             q = torch.cat(q_steps, dim=0) if q_steps else p[:0]
 
             n_accepted, next_token = verify_draft(p, q, x[0, prefix_len:])
+            if stats is not None:
+                stats.record(drafted=k, accepted=n_accepted)
             # 被拒绝的草稿已经写进两边的 cache,回滚到最后一个被接受的位置
             draft.rollback(prefix_len + n_accepted)
             target.rollback(prefix_len + n_accepted)
@@ -273,8 +264,10 @@ def generate(
     input_ids = tokenizer.encode(input_text, return_tensors='pt').to(device)
     sampling = dict(temperature=temperature, top_k=top_k, top_p=top_p)
 
-    def run_speculative(n: int) -> torch.Tensor:
-        return speculative_sampling(input_ids, approx_model, target_model, n, gamma=gamma, **sampling)
+    def run_speculative(n: int, stats: SpeculativeStats | None = None) -> torch.Tensor:
+        return speculative_sampling(
+            input_ids, approx_model, target_model, n, gamma=gamma, stats=stats, **sampling
+        )
 
     def run_autoregressive(n: int) -> torch.Tensor:
         return autoregressive_sampling(input_ids, target_model, n, **sampling)
@@ -283,14 +276,25 @@ def generate(
     run_speculative(gamma + 1)
     run_autoregressive(2)
 
-    for name, run in (
-        ('speculative_sampling', run_speculative),
-        ('autoregressive_sampling', run_autoregressive),
+    stats = SpeculativeStats()
+    set_seed(seed)
+    with device_timer(device) as speculative_timer:
+        speculative_ids = run_speculative(num_tokens, stats)
+    set_seed(seed)
+    with device_timer(device) as autoregressive_timer:
+        autoregressive_ids = run_autoregressive(num_tokens)
+
+    for name, output_ids in (
+        ('speculative_sampling', speculative_ids),
+        ('autoregressive_sampling', autoregressive_ids),
     ):
-        set_seed(seed)
-        output_ids, elapsed = timed(lambda run=run: run(num_tokens), device)
-        text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        print(f'{name} ({elapsed:.2f}s, {num_tokens / elapsed:.1f} tok/s): {text}')
+        print(f'{name}: {tokenizer.decode(output_ids[0], skip_special_tokens=True)}')
+
+    print()
+    print(f'speculative (gamma={gamma}): {throughput_summary(num_tokens, speculative_timer.elapsed)}')
+    print(f'  {stats.summary()}')
+    print(f'autoregressive: {throughput_summary(num_tokens, autoregressive_timer.elapsed)}')
+    print(f'speedup: {autoregressive_timer.elapsed / speculative_timer.elapsed:.2f}x')
 
 
 if __name__ == '__main__':
